@@ -1,11 +1,116 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
+
+/* ═══════════════════════════════ GLOBAL RESPONSIVE SETUP ══════════════════ */
+// Inject viewport meta + global reset for full Android/iOS support
+(function setupViewport() {
+  // Viewport meta — prevents zoom, enables full screen on Android
+  let vm = document.querySelector('meta[name="viewport"]');
+  if (!vm) { vm = document.createElement('meta'); vm.name = 'viewport'; document.head.appendChild(vm); }
+  vm.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+
+  // Theme color for Android status bar
+  let tc = document.querySelector('meta[name="theme-color"]');
+  if (!tc) { tc = document.createElement('meta'); tc.name = 'theme-color'; document.head.appendChild(tc); }
+  tc.content = '#060400';
+
+  // Global CSS reset — full height, no bounce, no tap flash
+  const style = document.createElement('style');
+  style.textContent = `
+    *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body, #root { margin: 0; padding: 0; width: 100%; height: 100%; background: #060400; overflow: hidden; }
+    body { -webkit-font-smoothing: antialiased; touch-action: manipulation; overscroll-behavior: none; }
+    input, select, button, textarea { font-family: inherit; border-radius: 0; }
+    input[type="date"] { color-scheme: dark; }
+    ::-webkit-scrollbar { width: 3px; background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a1a08; border-radius: 3px; }
+    * { -webkit-user-select: none; user-select: none; }
+    input, textarea { -webkit-user-select: text; user-select: text; }
+  `;
+  document.head.appendChild(style);
+
+  // Load Cinzel + Lato from Google Fonts
+  if (!document.querySelector('link[href*="Cinzel"]')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700&family=Cinzel:wght@400;600;700&family=Lato:wght@300;400;700&display=swap';
+    document.head.appendChild(link);
+  }
+})();
+
 
 /* ═══════════════════════════════════════ STORAGE ═══════════════════════════ */
-const DB = {
-  async get(k) { try { const r = await window.storage.get(k); return r ? JSON.parse(r.value) : null; } catch { return null; } },
-  async set(k, v) { try { await window.storage.set(k, JSON.stringify(v)); } catch {} },
+// Robust storage using window.storage persistent API
+// Uses a SENTINEL pattern: on first run we write a "seeded" flag so we never
+// overwrite user data with defaults again, even if reads return null/throw.
+
+const STORE_VER = "v4"; // bump this only to reset all data intentionally
+const K = {
+  SEEDED:       "stg_seeded_"  + STORE_VER,
+  TCREDS:       "stg_tc_"      + STORE_VER,
+  EVENTS:       "stg_ev_"      + STORE_VER,
+  CONTRIBUTIONS:"stg_co_"      + STORE_VER,
+  EXPENSES:     "stg_ex_"      + STORE_VER,
+  GALLERY:      "stg_ga_"      + STORE_VER,
+  SESSION:      "stg_sess_"    + STORE_VER,
 };
-const K = { TCREDS:"st_tc", EVENTS:"st_ev", CONTRIBUTIONS:"st_co", EXPENSES:"st_ex", GALLERY:"st_ga", SESSION:"st_sess" };
+
+const DB = {
+  // Returns parsed value, or undefined if key missing/error
+  async get(k) {
+    try {
+      const r = await window.storage.get(k);
+      if (!r) return undefined;
+      const v = r.value;
+      if (v === null || v === undefined) return undefined;
+      if (typeof v === "object") return v;           // already parsed
+      if (typeof v === "string") return JSON.parse(v);
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  // Stores value reliably, returns true on success
+  async set(k, v) {
+    try {
+      await window.storage.set(k, JSON.stringify(v));
+      return true;
+    } catch(e) {
+      console.error("[DB.set] failed for key:", k, e);
+      return false;
+    }
+  },
+
+  // Seed all defaults ONCE, then never again
+  async seedOnce(defaults) {
+    const seeded = await this.get(K.SEEDED);
+    if (seeded === true || seeded === "true") return false; // already seeded
+
+    // Write all defaults in parallel
+    await Promise.all([
+      this.set(K.TCREDS,        defaults.tc),
+      this.set(K.EVENTS,        defaults.events),
+      this.set(K.CONTRIBUTIONS, defaults.co),
+      this.set(K.EXPENSES,      defaults.ex),
+      this.set(K.GALLERY,       defaults.gal),
+    ]);
+    await this.set(K.SEEDED, true);
+    return true; // was freshly seeded
+  },
+
+  // Load all app data at once
+  async loadAll() {
+    const [tc, ev, co, ex, ga, sess] = await Promise.all([
+      this.get(K.TCREDS),
+      this.get(K.EVENTS),
+      this.get(K.CONTRIBUTIONS),
+      this.get(K.EXPENSES),
+      this.get(K.GALLERY),
+      this.get(K.SESSION),
+    ]);
+    return { tc, ev, co, ex, ga, sess };
+  },
+};
 
 /* ═══════════════════════════════════════ SEED DATA ═════════════════════════ */
 const DEF_TC = { username: "treasurer", password: "shivtej@2025", name: "Rajesh Patil", avatar: "RP" };
@@ -169,41 +274,78 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [tc,ev,co,ex,ga,sess] = await Promise.all([
-        DB.get(K.TCREDS),DB.get(K.EVENTS),DB.get(K.CONTRIBUTIONS),
-        DB.get(K.EXPENSES),DB.get(K.GALLERY),DB.get(K.SESSION),
-      ]);
-      if(tc) setTCreds(tc); else await DB.set(K.TCREDS,DEF_TC);
-      if(ev) setEvents(ev); else await DB.set(K.EVENTS,DEF_EVTS);
-      if(co) setContribs(co); else await DB.set(K.CONTRIBUTIONS,DEF_CO);
-      if(ex) setExpenses(ex); else await DB.set(K.EXPENSES,DEF_EX);
-      if(ga) setGallery(ga); else await DB.set(K.GALLERY,DEF_GAL);
-      if(sess?.role==="treasurer") setIsTreasurer(true);
+      try {
+        // Step 1: Seed defaults the very first time (no-op on subsequent loads)
+        await DB.seedOnce({
+          tc: DEF_TC, events: DEF_EVTS, co: DEF_CO, ex: DEF_EX, gal: DEF_GAL,
+        });
+
+        // Step 2: Load all saved data
+        const { tc, ev, co, ex, ga, sess } = await DB.loadAll();
+
+        // Step 3: Hydrate state — use saved data, fall back to defaults only if
+        // the value is genuinely missing (undefined), never overwrite real saves
+        if (tc  !== undefined && !Array.isArray(tc))  setTCreds(tc);
+        if (Array.isArray(ev)  && ev.length  > 0)     setEvents(ev);
+        if (Array.isArray(co)  && co.length  > 0)     setContribs(co);
+        if (Array.isArray(ex)  && ex.length  >= 0)    setExpenses(ex);
+        if (Array.isArray(ga)  && ga.length  >= 0)    setGallery(ga);
+        if (sess?.role === "treasurer")                setIsTreasurer(true);
+
+      } catch(e) {
+        console.error("[Boot] error:", e);
+      }
       setLoading(false);
     })();
   }, []);
 
-  const flash = (msg,ok=true) => { setToast({msg,ok}); setTimeout(()=>setToast(null),3200); };
-  const save  = useCallback(async (k,d) => { await DB.set(k,d); },[]);
+  const flash = (msg, ok=true) => { setToast({msg,ok}); setTimeout(()=>setToast(null),3200); };
 
   const doLogin = async (u,p) => {
     if(u===tCreds.username && p===tCreds.password) {
       setIsTreasurer(true); setLoginModal(false);
-      await DB.set(K.SESSION,{role:"treasurer"}); flash("जय शिवाजी! Welcome Treasurer 🔑"); return true;
+      await DB.set(K.SESSION, {role:"treasurer"});
+      flash("जय शिवाजी! Welcome Treasurer 🔑"); return true;
     }
     return false;
   };
-  const doLogout = async () => { setIsTreasurer(false); await DB.set(K.SESSION,null); flash("Logged out"); };
+  const doLogout = async () => { setIsTreasurer(false); await DB.set(K.SESSION, null); flash("Logged out"); };
 
+  // Use functional state updates so mutations always operate on fresh state
+  // and persist the updated array to DB immediately
   const mut = {
-    addEvent:   ev => { const u=[...events,ev];   setEvents(u);   save(K.EVENTS,u);        flash("कार्यक्रम तयार झाला ✓"); },
-    delEvent:   id => { const u=events.filter(e=>e.id!==id); setEvents(u); save(K.EVENTS,u); flash("Event deleted"); },
-    addExpense: ex => { const u=[...expenses,ex]; setExpenses(u); save(K.EXPENSES,u);      flash("खर्च नोंदवला ✓"); },
-    delExpense: id => { const u=expenses.filter(e=>e.id!==id); setExpenses(u); save(K.EXPENSES,u); flash("Deleted"); },
-    addContrib: c  => { const u=[...contribs,c];  setContribs(u); save(K.CONTRIBUTIONS,u); flash("वर्गणी जोडली ✓"); },
-    markPaid:   id => { const u=contribs.map(c=>c.id===id?{...c,status:"paid",date:today()}:c); setContribs(u); save(K.CONTRIBUTIONS,u); flash("भरले ✓"); },
-    addGallery: g  => { const u=[...gallery,g];   setGallery(u);  save(K.GALLERY,u);        flash("Gallery updated ✓"); },
-    delGallery: id => { const u=gallery.filter(g=>g.id!==id); setGallery(u); save(K.GALLERY,u); flash("Removed"); },
+    addEvent: ev => {
+      setEvents(prev => { const u=[...prev,ev]; DB.set(K.EVENTS,u); return u; });
+      flash("कार्यक्रम तयार झाला ✓");
+    },
+    delEvent: id => {
+      setEvents(prev => { const u=prev.filter(e=>e.id!==id); DB.set(K.EVENTS,u); return u; });
+      flash("Event deleted");
+    },
+    addExpense: ex => {
+      setExpenses(prev => { const u=[...prev,ex]; DB.set(K.EXPENSES,u); return u; });
+      flash("खर्च नोंदवला ✓");
+    },
+    delExpense: id => {
+      setExpenses(prev => { const u=prev.filter(e=>e.id!==id); DB.set(K.EXPENSES,u); return u; });
+      flash("Deleted");
+    },
+    addContrib: c => {
+      setContribs(prev => { const u=[...prev,c]; DB.set(K.CONTRIBUTIONS,u); return u; });
+      flash("वर्गणी जोडली ✓");
+    },
+    markPaid: id => {
+      setContribs(prev => { const u=prev.map(c=>c.id===id?{...c,status:"paid",date:today()}:c); DB.set(K.CONTRIBUTIONS,u); return u; });
+      flash("भरले ✓");
+    },
+    addGallery: g => {
+      setGallery(prev => { const u=[...prev,g]; DB.set(K.GALLERY,u); return u; });
+      flash("Gallery updated ✓");
+    },
+    delGallery: id => {
+      setGallery(prev => { const u=prev.filter(g=>g.id!==id); DB.set(K.GALLERY,u); return u; });
+      flash("Removed");
+    },
   };
 
   const totC = contribs.filter(c=>c.status==="paid").reduce((s,c)=>s+c.amount,0);
@@ -777,10 +919,10 @@ function FSel({l,v,s,opts,labels}) {
 
 /* ═══════════════════════════ STYLES ═════════════════════════════════════════ */
 const Z = {
-  shell:         {display:"flex",flexDirection:"column",height:"100vh",maxWidth:480,margin:"0 auto",background:"#060400",fontFamily:"'Lato',sans-serif",overflow:"hidden"},
-  main:          {flex:1,overflowY:"auto",background:"#060400"},
-  page:          {padding:"16px 16px 90px"},
-  hdr:           {background:"linear-gradient(135deg,#100800,#1c1000)",borderBottom:"2px solid #2a1a06",padding:"11px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0},
+  shell:         {display:"flex",flexDirection:"column",width:"100%",height:"100%",position:"fixed",top:0,left:0,right:0,bottom:0,background:"#060400",fontFamily:"'Lato',sans-serif",overflow:"hidden"},
+  main:          {flex:1,overflowY:"auto",overflowX:"hidden",background:"#060400",WebkitOverflowScrolling:"touch"},
+  page:          {padding:"16px",paddingBottom:"calc(80px + env(safe-area-inset-bottom, 0px))",boxSizing:"border-box",width:"100%"},
+  hdr:           {background:"linear-gradient(135deg,#100800,#1c1000)",borderBottom:"2px solid #2a1a06",padding:"11px 16px",paddingTop:"calc(11px + env(safe-area-inset-top, 0px))",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0},
   hdrL:          {display:"flex",alignItems:"center",gap:10},
   hdrR:          {display:"flex",alignItems:"center",gap:8},
   brand:         {fontFamily:"'Cinzel Decorative',serif",color:"#e8d5a0",fontSize:17,fontWeight:700,lineHeight:1,letterSpacing:2},
@@ -788,10 +930,10 @@ const Z = {
   tChip:         {background:"#1a1000",color:"#d4a012",fontSize:10,padding:"4px 10px",borderRadius:20,border:"1px solid #d4a01244",display:"flex",alignItems:"center",gap:4,whiteSpace:"nowrap"},
   loginChip:     {background:"#1a1000",color:"#d4a012",fontSize:10,padding:"6px 12px",borderRadius:20,border:"1px solid #d4a01244",display:"flex",alignItems:"center",gap:5,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'Lato',sans-serif"},
   iconBtn:       {background:"none",border:"none",cursor:"pointer",padding:4},
-  nav:           {background:"linear-gradient(0deg,#100800,#0c0600)",borderTop:"2px solid #2a1a06",display:"flex",padding:"8px 0 12px",flexShrink:0},
-  navBtn:        {flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:1,padding:"4px 2px"},
+  nav:           {background:"linear-gradient(0deg,#100800,#0c0600)",borderTop:"2px solid #2a1a06",display:"flex",padding:"8px 0",paddingBottom:"calc(12px + env(safe-area-inset-bottom, 0px))",flexShrink:0},
+  navBtn:        {flex:1,background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"6px 4px",minHeight:48,justifyContent:"center",WebkitTapHighlightColor:"transparent"},
   navOn:         {},
-  hero:          {borderRadius:20,padding:"20px 18px",marginBottom:4,display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",overflow:"hidden",background:"linear-gradient(135deg,#140a00,#201400)",border:"1px solid #2a1a08",minHeight:148},
+  hero:          {borderRadius:16,padding:"18px 16px",marginBottom:4,display:"flex",alignItems:"center",justifyContent:"space-between",position:"relative",overflow:"hidden",background:"linear-gradient(135deg,#140a00,#201400)",border:"1px solid #2a1a08",minHeight:140},
   heroPat:       {position:"absolute",inset:0,backgroundImage:"radial-gradient(circle at 75% 25%, #d4a01214 0%, transparent 50%), radial-gradient(circle at 15% 75%, #8b000012 0%, transparent 45%)",pointerEvents:"none"},
   tBadgeLg:      {background:"#1a1000",color:"#d4a012",fontSize:10,padding:"4px 12px",borderRadius:20,display:"inline-flex",alignItems:"center",gap:4,border:"1px solid #d4a01233"},
   card:          {background:"#0e0900",borderRadius:16,padding:16,marginBottom:12,border:"1px solid #1e1408"},
@@ -808,25 +950,25 @@ const Z = {
   cCard:         {background:"#0e0900",borderRadius:14,padding:14,marginBottom:10,border:"1px solid #1e1408",display:"flex",alignItems:"flex-start",gap:12},
   cAv:           {width:40,height:40,borderRadius:"50%",background:"#1a1000",border:"2px solid #d4a01244",display:"flex",alignItems:"center",justifyContent:"center",color:"#d4a012",fontWeight:700,fontSize:12,flexShrink:0},
   pill:          {fontSize:10,fontWeight:600,padding:"2px 8px",borderRadius:10,marginTop:4,display:"inline-block"},
-  payBtn:        {background:"#082212",color:"#2d9e6b",border:"none",borderRadius:8,padding:"4px 10px",fontSize:11,fontWeight:600,cursor:"pointer",marginTop:4,display:"block"},
+  payBtn:        {background:"#082212",color:"#2d9e6b",border:"none",borderRadius:8,padding:"8px 14px",fontSize:12,fontWeight:600,cursor:"pointer",marginTop:6,display:"block",minHeight:36,WebkitTapHighlightColor:"transparent"},
   expCard:       {background:"#0e0900",borderRadius:14,padding:14,marginBottom:10,border:"1px solid #1e1408",display:"flex",alignItems:"center",gap:12},
   expIc:         {width:42,height:42,borderRadius:12,background:"#1a1000",border:"1px solid #2a1a08",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0},
-  delBtn:        {background:"none",border:"1px solid #380808",borderRadius:8,color:"#c1121f",fontSize:11,padding:"5px 12px",cursor:"pointer",marginTop:10,display:"inline-block"},
+  delBtn:        {background:"none",border:"1px solid #380808",borderRadius:8,color:"#c1121f",fontSize:12,padding:"8px 14px",cursor:"pointer",marginTop:10,display:"inline-block",minHeight:36,WebkitTapHighlightColor:"transparent"},
   fRow:          {display:"flex",gap:8,marginBottom:14},
   fBtn:          {background:"#0e0900",border:"1px solid #1e1408",borderRadius:20,padding:"6px 14px",color:"#3a2410",fontSize:12,cursor:"pointer"},
   fOn:           {background:"#1a1000",borderColor:"#d4a012",color:"#d4a012"},
   notice:        {background:"#0e0c06",border:"1px solid #d4a01218",borderRadius:12,padding:"12px 14px",color:"#4a3218",fontSize:12,marginTop:12,display:"flex",alignItems:"center",gap:8,lineHeight:1.5},
   overlay:       {position:"fixed",inset:0,background:"#000000cc",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:100,backdropFilter:"blur(6px)"},
-  modal:         {background:"#0e0900",borderRadius:"22px 22px 0 0",padding:"0 24px 36px",width:"100%",maxWidth:480,border:"1px solid #2a1a08",position:"relative"},
+  modal:         {background:"#0e0900",borderRadius:"22px 22px 0 0",padding:"0 20px",paddingBottom:"calc(36px + env(safe-area-inset-bottom, 0px))",width:"100%",border:"1px solid #2a1a08",position:"relative"},
   modalTopBorder:{height:5,background:"linear-gradient(90deg,#8b0000,#d4a012,#ff6b35,#d4a012,#8b0000)",borderRadius:"22px 22px 0 0",margin:"0 -1px",marginBottom:20},
   modalClose:    {position:"absolute",top:18,right:18,background:"none",border:"none",cursor:"pointer",padding:6},
   errBox:        {background:"#280608",border:"1px solid #c1121f44",borderRadius:10,padding:"10px 12px",color:"#c1121f",fontSize:13,marginBottom:12},
   lbl:           {color:"#5a3a18",fontSize:12,marginBottom:4,display:"block"},
-  inp:           {width:"100%",background:"#080600",border:"1px solid #1e1408",borderRadius:10,padding:"11px 12px",color:"#d4c080",fontSize:14,marginBottom:12,outline:"none",boxSizing:"border-box",fontFamily:"'Lato',sans-serif"},
+  inp:           {width:"100%",background:"#080600",border:"1px solid #1e1408",borderRadius:10,padding:"13px 14px",color:"#d4c080",fontSize:16,marginBottom:12,outline:"none",boxSizing:"border-box",fontFamily:"'Lato',sans-serif",WebkitAppearance:"none",appearance:"none"},
   eyeBtn:        {position:"absolute",right:12,top:"50%",transform:"translateY(-70%)",background:"none",border:"none",cursor:"pointer",padding:4},
-  goldBtn:       {flex:1,background:"linear-gradient(135deg,#d4a012,#9a6e08)",color:"#040200",border:"none",borderRadius:10,padding:"12px",fontWeight:700,fontSize:14,cursor:"pointer",fontFamily:"'Cinzel',serif",letterSpacing:0.5},
-  goldBtnSm:     {background:"linear-gradient(135deg,#d4a012,#9a6e08)",color:"#040200",border:"none",borderRadius:20,padding:"7px 14px",fontWeight:700,fontSize:11,cursor:"pointer",fontFamily:"'Cinzel',serif"},
+  goldBtn:       {flex:1,background:"linear-gradient(135deg,#d4a012,#9a6e08)",color:"#040200",border:"none",borderRadius:10,padding:"14px",fontWeight:700,fontSize:15,cursor:"pointer",fontFamily:"'Cinzel',serif",letterSpacing:0.5,minHeight:48,WebkitTapHighlightColor:"transparent"},
+  goldBtnSm:     {background:"linear-gradient(135deg,#d4a012,#9a6e08)",color:"#040200",border:"none",borderRadius:20,padding:"9px 16px",fontWeight:700,fontSize:12,cursor:"pointer",fontFamily:"'Cinzel',serif",minHeight:38,WebkitTapHighlightColor:"transparent"},
   cancelBtn:     {flex:1,background:"#14100a",color:"#5a3a18",border:"1px solid #1e1408",borderRadius:10,padding:"12px",fontWeight:600,cursor:"pointer"},
   fBox:          {background:"#0e0900",borderRadius:16,padding:18,marginBottom:16,border:"1px solid #d4a01222"},
-  toast:         {position:"fixed",bottom:80,left:"50%",transform:"translateX(-50%)",padding:"10px 20px",borderRadius:24,color:"#d4c080",fontWeight:600,fontSize:13,boxShadow:"0 8px 28px #00000099",zIndex:200,whiteSpace:"nowrap",border:"1px solid",display:"flex",alignItems:"center",gap:6},
+  toast:         {position:"fixed",bottom:"calc(72px + env(safe-area-inset-bottom, 0px))",left:"50%",transform:"translateX(-50%)",padding:"10px 20px",borderRadius:24,color:"#d4c080",fontWeight:600,fontSize:13,boxShadow:"0 8px 28px #00000099",zIndex:200,whiteSpace:"nowrap",border:"1px solid",display:"flex",alignItems:"center",gap:6},
 };
