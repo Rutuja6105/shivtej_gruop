@@ -1,16 +1,37 @@
-# React + Vite
+# शिवतेज Group Finance Manager
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Full-stack web app with React frontend + Vercel Serverless API + Supabase PostgreSQL.
 
-Currently, two official plugins are available:
+## Setup on Vercel
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+### 1. Upload to GitHub
+- Create a new GitHub repository
+- Upload all files from this folder
 
-## React Compiler
+### 2. Deploy on Vercel
+- Go to vercel.com → New Project → Import from GitHub
+- Framework: Create React App
+- Click Deploy
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### 3. Add Database Environment Variable
+After deploy, go to:
+**Vercel Dashboard → Your Project → Settings → Environment Variables**
 
-## Expanding the ESLint configuration
+Add this variable:
+- **Name:** `DATABASE_URL`
+- **Value:** `postgresql://postgres:[YOUR-PASSWORD]@db.voaniokkktdmpatipdze.supabase.co:5432/postgres`
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Replace `[YOUR-PASSWORD]` with your actual Supabase database password.
+
+> Get password from: supabase.com → Project Settings → Database → Database password
+
+### 4. Redeploy
+After adding the env variable, go to:
+**Vercel → Deployments → Redeploy**
+
+### 5. Done!
+Your app is live with real PostgreSQL database. All data persists across devices.
+
+## Default Login
+- Username: `treasurer`
+- Password: `shivtej@2025`
