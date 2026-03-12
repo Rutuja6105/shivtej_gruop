@@ -38,77 +38,99 @@ import { useState, useEffect } from "react";
 })();
 
 
-/* ═══════════════════════════════════════ STORAGE ═══════════════════════════ */
-// Robust storage using window.storage persistent API
-// Uses a SENTINEL pattern: on first run we write a "seeded" flag so we never
-// overwrite user data with defaults again, even if reads return null/throw.
+/* ═══════════════════════════════════════════════════════════════════════════
+   SUPABASE POSTGRESQL LAYER
+   ─────────────────────────────────────────────────────────────────────────
+   Free tier: 500MB DB, unlimited API calls, works from any browser/device.
+   Tables used: app_data (key TEXT PRIMARY KEY, data JSONB, updated_at TIMESTAMPTZ)
 
-const STORE_VER = "v4"; // bump this only to reset all data intentionally
-const K = {
-  SEEDED:       "stg_seeded_"  + STORE_VER,
-  TCREDS:       "stg_tc_"      + STORE_VER,
-  EVENTS:       "stg_ev_"      + STORE_VER,
-  CONTRIBUTIONS:"stg_co_"      + STORE_VER,
-  EXPENSES:     "stg_ex_"      + STORE_VER,
-  GALLERY:      "stg_ga_"      + STORE_VER,
-  SESSION:      "stg_sess_"    + STORE_VER,
+   ONE-TIME SETUP:
+   1. Go to https://supabase.com → New project (free)
+   2. SQL Editor → run the SQL from the setup modal
+   3. Project Settings → API → copy URL + anon key
+   4. In app: login as Treasurer → tap ⚙️ → paste URL + key → Connect
+═══════════════════════════════════════════════════════════════════════════ */
+
+const CFG_KEY     = "stg_supa_cfg_v1";
+const SESSION_KEY = "stg_session_v1";
+
+// Tiny localStorage helper
+const LocalStore = {
+  get(k)   { try { const v=localStorage.getItem(k); return v?JSON.parse(v):null; } catch{return null;} },
+  set(k,v) { try { localStorage.setItem(k,JSON.stringify(v)); } catch{} },
+  del(k)   { try { localStorage.removeItem(k); } catch{} },
 };
 
-const DB = {
-  // Returns parsed value, or undefined if key missing/error
-  async get(k) {
-    try {
-      const r = await window.storage.get(k);
-      if (!r) return undefined;
-      const v = r.value;
-      if (v === null || v === undefined) return undefined;
-      if (typeof v === "object") return v;           // already parsed
-      if (typeof v === "string") return JSON.parse(v);
-      return undefined;
-    } catch {
-      return undefined;
-    }
+// Supabase REST client — uses the auto-generated REST API (no SDK needed)
+const Supa = {
+  cfg: null,
+
+  init(cfg) { this.cfg = cfg; },
+
+  get isReady() { return !!(this.cfg?.url && this.cfg?.key); },
+
+  // Base URL for the app_data table
+  tableUrl() { return `${this.cfg.url}/rest/v1/app_data`; },
+
+  headers(extra={}) {
+    return {
+      "Content-Type":  "application/json",
+      "apikey":        this.cfg.key,
+      "Authorization": `Bearer ${this.cfg.key}`,
+      "Prefer":        "return=minimal",
+      ...extra,
+    };
   },
 
-  // Stores value reliably, returns true on success
-  async set(k, v) {
+  // Load a single row by key (returns parsed data array/object or null)
+  async load(key) {
     try {
-      await window.storage.set(k, JSON.stringify(v));
+      const res = await fetch(`${this.tableUrl()}?key=eq.${key}&select=data`, {
+        headers: { ...this.headers(), Prefer: undefined },
+      });
+      if (!res.ok) return null;
+      const rows = await res.json();
+      return rows?.[0]?.data ?? null;
+    } catch(e) { console.error("[Supa.load]", key, e); return null; }
+  },
+
+  // Upsert a row {key, data, updated_at}
+  async save(key, data) {
+    try {
+      const res = await fetch(this.tableUrl(), {
+        method:  "POST",
+        headers: { ...this.headers(), Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ key, data, updated_at: new Date().toISOString() }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        console.error("[Supa.save]", key, res.status, err);
+        return false;
+      }
       return true;
-    } catch(e) {
-      console.error("[DB.set] failed for key:", k, e);
-      return false;
-    }
+    } catch(e) { console.error("[Supa.save]", key, e); return false; }
   },
 
-  // Seed all defaults ONCE, then never again
-  async seedOnce(defaults) {
-    const seeded = await this.get(K.SEEDED);
-    if (seeded === true || seeded === "true") return false; // already seeded
-
-    // Write all defaults in parallel
-    await Promise.all([
-      this.set(K.TCREDS,        defaults.tc),
-      this.set(K.EVENTS,        defaults.events),
-      this.set(K.CONTRIBUTIONS, defaults.co),
-      this.set(K.EXPENSES,      defaults.ex),
-      this.set(K.GALLERY,       defaults.gal),
-    ]);
-    await this.set(K.SEEDED, true);
-    return true; // was freshly seeded
+  // Test connection — tries to read the config row
+  async ping() {
+    try {
+      const res = await fetch(`${this.tableUrl()}?key=eq.__ping__&select=key`, {
+        headers: { ...this.headers(), Prefer: undefined },
+      });
+      return res.ok;
+    } catch { return false; }
   },
 
-  // Load all app data at once
+  // Load all app collections at once
   async loadAll() {
-    const [tc, ev, co, ex, ga, sess] = await Promise.all([
-      this.get(K.TCREDS),
-      this.get(K.EVENTS),
-      this.get(K.CONTRIBUTIONS),
-      this.get(K.EXPENSES),
-      this.get(K.GALLERY),
-      this.get(K.SESSION),
+    const [ev, co, ex, ga, cfg] = await Promise.all([
+      this.load("events"),
+      this.load("contributions"),
+      this.load("expenses"),
+      this.load("gallery"),
+      this.load("config"),
     ]);
-    return { tc, ev, co, ex, ga, sess };
+    return { ev, co, ex, ga, cfg };
   },
 };
 
@@ -264,86 +286,184 @@ export default function App() {
   const [isTreasurer, setIsTreasurer] = useState(false);
   const [tab,         setTab]         = useState("home");
   const [loginModal,  setLoginModal]  = useState(false);
+  const [setupModal,  setSetupModal]  = useState(false);
   const [toast,       setToast]       = useState(null);
   const [loading,     setLoading]     = useState(true);
+  const [dbStatus,    setDbStatus]    = useState("disconnected"); // disconnected | connecting | connected | error
   const [tCreds,      setTCreds]      = useState(DEF_TC);
   const [events,      setEvents]      = useState(DEF_EVTS);
   const [contribs,    setContribs]    = useState(DEF_CO);
   const [expenses,    setExpenses]    = useState(DEF_EX);
   const [gallery,     setGallery]     = useState(DEF_GAL);
 
+  // ── BOOT: Load Supabase config then fetch data
   useEffect(() => {
     (async () => {
       try {
-        // Step 1: Seed defaults the very first time (no-op on subsequent loads)
-        await DB.seedOnce({
-          tc: DEF_TC, events: DEF_EVTS, co: DEF_CO, ex: DEF_EX, gal: DEF_GAL,
-        });
+        // Load saved Supabase config from localStorage
+        const savedCfg = LocalStore.get(CFG_KEY);
+        if (savedCfg?.appId && savedCfg?.apiKey) {
+          Supa.init(savedCfg);
+          setDbStatus("connecting");
 
-        // Step 2: Load all saved data
-        const { tc, ev, co, ex, ga, sess } = await DB.loadAll();
+          const ok = await Supa.ping();
+          if (ok) {
+            setDbStatus("connected");
+            const { ev, co, ex, ga, cfg } = await Supa.loadAll();
+            if (Array.isArray(ev)  && ev.length  > 0) setEvents(ev);
+            if (Array.isArray(co)  && co.length  > 0) setContribs(co);
+            if (Array.isArray(ex)  && ex.length  >= 0) setExpenses(ex);
+            if (Array.isArray(ga)  && ga.length  >= 0) setGallery(ga);
+            if (cfg?.treasurer) setTCreds(cfg.treasurer);
+          } else {
+            setDbStatus("error");
+          }
+        } else {
+          setDbStatus("disconnected");
+        }
 
-        // Step 3: Hydrate state — use saved data, fall back to defaults only if
-        // the value is genuinely missing (undefined), never overwrite real saves
-        if (tc  !== undefined && !Array.isArray(tc))  setTCreds(tc);
-        if (Array.isArray(ev)  && ev.length  > 0)     setEvents(ev);
-        if (Array.isArray(co)  && co.length  > 0)     setContribs(co);
-        if (Array.isArray(ex)  && ex.length  >= 0)    setExpenses(ex);
-        if (Array.isArray(ga)  && ga.length  >= 0)    setGallery(ga);
-        if (sess?.role === "treasurer")                setIsTreasurer(true);
+        // Restore session
+        const sess = LocalStore.get(SESSION_KEY);
+        if (sess?.role === "treasurer") setIsTreasurer(true);
 
       } catch(e) {
-        console.error("[Boot] error:", e);
+        console.error("[Boot]", e);
+        setDbStatus("error");
       }
       setLoading(false);
     })();
   }, []);
 
-  const flash = (msg, ok=true) => { setToast({msg,ok}); setTimeout(()=>setToast(null),3200); };
+  const flash = (msg, ok=true) => { setToast({msg,ok}); setTimeout(()=>setToast(null),3500); };
 
-  const doLogin = async (u,p) => {
-    if(u===tCreds.username && p===tCreds.password) {
-      setIsTreasurer(true); setLoginModal(false);
-      await DB.set(K.SESSION, {role:"treasurer"});
-      flash("जय शिवाजी! Welcome Treasurer 🔑"); return true;
+  // ── Save to Supabase helper
+  const mongoPersist = async (collection, data) => {
+    if (!Supa.isReady) return;
+    const ok = await Supa.save(collection, data);
+    if (!ok) flash("⚠️ Supabase save failed — check connection", false);
+  };
+
+  // ── Login / Logout
+  const doLogin = async (u, p) => {
+    if (u === tCreds.username && p === tCreds.password) {
+      setIsTreasurer(true);
+      setLoginModal(false);
+      LocalStore.set(SESSION_KEY, { role:"treasurer" });
+      flash("जय शिवाजी! Welcome Treasurer 🔑");
+      return true;
     }
     return false;
   };
-  const doLogout = async () => { setIsTreasurer(false); await DB.set(K.SESSION, null); flash("Logged out"); };
+  const doLogout = () => {
+    setIsTreasurer(false);
+    LocalStore.del(SESSION_KEY);
+    flash("Logged out");
+  };
 
-  // Use functional state updates so mutations always operate on fresh state
-  // and persist the updated array to DB immediately
+  // ── Supabase Setup handler
+  const doSetupSupa = async (cfg) => {
+    Supa.init(cfg);
+    setDbStatus("connecting");
+    const ok = await Supa.ping();
+    if (ok) {
+      LocalStore.set(CFG_KEY, cfg);
+      setDbStatus("connected");
+      // Push current data to Supabase on first connect
+      await Promise.all([
+        Supa.save("events",        events),
+        Supa.save("contributions", contribs),
+        Supa.save("expenses",      expenses),
+        Supa.save("gallery",       gallery),
+        Supa.save("config",        { treasurer: tCreds }),
+      ]);
+      flash("✅ Supabase connected & data synced!");
+      setSetupModal(false);
+      return true;
+    } else {
+      setDbStatus("error");
+      flash("❌ Connection failed — check your URL & API Key", false);
+      return false;
+    }
+  };
+
+  // ── Export JSON
+  const doExport = () => {
+    const data = {
+      _meta: { app:"Shivtej Group", exported: new Date().toISOString().slice(0,10) },
+      treasurer: tCreds, events, contributions: contribs, expenses, gallery,
+    };
+    const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = `shivtej_db_${data._meta.exported}.json`; a.click();
+    URL.revokeObjectURL(url);
+    flash("📥 Exported!");
+  };
+
+  // ── Mutations — update state + persist to Supabase
   const mut = {
     addEvent: ev => {
-      setEvents(prev => { const u=[...prev,ev]; DB.set(K.EVENTS,u); return u; });
+      setEvents(prev => {
+        const u = [...prev, ev];
+        supaPersist("events", u);
+        return u;
+      });
       flash("कार्यक्रम तयार झाला ✓");
     },
     delEvent: id => {
-      setEvents(prev => { const u=prev.filter(e=>e.id!==id); DB.set(K.EVENTS,u); return u; });
+      setEvents(prev => {
+        const u = prev.filter(e => e.id !== id);
+        supaPersist("events", u);
+        return u;
+      });
       flash("Event deleted");
     },
     addExpense: ex => {
-      setExpenses(prev => { const u=[...prev,ex]; DB.set(K.EXPENSES,u); return u; });
+      setExpenses(prev => {
+        const u = [...prev, ex];
+        supaPersist("expenses", u);
+        return u;
+      });
       flash("खर्च नोंदवला ✓");
     },
     delExpense: id => {
-      setExpenses(prev => { const u=prev.filter(e=>e.id!==id); DB.set(K.EXPENSES,u); return u; });
+      setExpenses(prev => {
+        const u = prev.filter(e => e.id !== id);
+        supaPersist("expenses", u);
+        return u;
+      });
       flash("Deleted");
     },
     addContrib: c => {
-      setContribs(prev => { const u=[...prev,c]; DB.set(K.CONTRIBUTIONS,u); return u; });
+      setContribs(prev => {
+        const u = [...prev, c];
+        supaPersist("contributions", u);
+        return u;
+      });
       flash("वर्गणी जोडली ✓");
     },
     markPaid: id => {
-      setContribs(prev => { const u=prev.map(c=>c.id===id?{...c,status:"paid",date:today()}:c); DB.set(K.CONTRIBUTIONS,u); return u; });
+      setContribs(prev => {
+        const u = prev.map(c => c.id===id ? {...c, status:"paid", date:today()} : c);
+        supaPersist("contributions", u);
+        return u;
+      });
       flash("भरले ✓");
     },
     addGallery: g => {
-      setGallery(prev => { const u=[...prev,g]; DB.set(K.GALLERY,u); return u; });
+      setGallery(prev => {
+        const u = [...prev, g];
+        supaPersist("gallery", u);
+        return u;
+      });
       flash("Gallery updated ✓");
     },
     delGallery: id => {
-      setGallery(prev => { const u=prev.filter(g=>g.id!==id); DB.set(K.GALLERY,u); return u; });
+      setGallery(prev => {
+        const u = prev.filter(g => g.id !== id);
+        supaPersist("gallery", u);
+        return u;
+      });
       flash("Removed");
     },
   };
@@ -381,10 +501,26 @@ export default function App() {
           </div>
         </div>
         <div style={Z.hdrR}>
+          {/* DB Status dot */}
+          <div
+            onClick={() => isTreasurer && setSetupModal(true)}
+            title={dbStatus==="connected"?"Supabase Connected":dbStatus==="connecting"?"Connecting...":dbStatus==="error"?"Connection Error":"Supabase Not Connected — tap to setup"}
+            style={{width:10,height:10,borderRadius:"50%",background:dbStatus==="connected"?"#2d9e6b":dbStatus==="connecting"?"#d4a012":dbStatus==="error"?"#c1121f":"#3a2410",cursor:isTreasurer?"pointer":"default",flexShrink:0,boxShadow:dbStatus==="connected"?"0 0 6px #2d9e6b88":dbStatus==="error"?"0 0 6px #c1121f88":"none"}}
+          />
           {isTreasurer ? (
             <>
               <div style={Z.tChip}><Ic n="shield" s={11} c="#d4a012"/> खजिनदार</div>
-              <button onClick={doLogout} style={Z.iconBtn}><Ic n="out" s={17} c="#6a4820"/></button>
+              <button onClick={()=>setSetupModal(true)} style={Z.iconBtn} title="Supabase Setup">
+                <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="#d4a01288" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+                </svg>
+              </button>
+              <button onClick={doExport} style={Z.iconBtn} title="Export JSON">
+                <svg width={17} height={17} viewBox="0 0 24 24" fill="none" stroke="#2d9e6b88" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </button>
+              <button onClick={doLogout} style={Z.iconBtn} title="Logout"><Ic n="out" s={17} c="#6a4820"/></button>
             </>
           ) : (
             <button onClick={()=>setLoginModal(true)} style={Z.loginChip}>
@@ -414,6 +550,7 @@ export default function App() {
       </nav>
 
       {loginModal && <LoginModal onLogin={doLogin} onClose={()=>setLoginModal(false)}/>}
+      {setupModal  && <SupaSetupModal cfg={LocalStore.get(CFG_KEY)} dbStatus={dbStatus} onSave={doSetupSupa} onClose={()=>setSetupModal(false)}/>}
 
       {toast && (
         <div style={{...Z.toast,background:toast.ok?"#0a2208":"#280808",borderColor:toast.ok?"#2d9e6b55":"#c1121f55"}}>
@@ -423,6 +560,126 @@ export default function App() {
     </div>
   );
 }
+
+
+/* ═══════════════════ SUPABASE SETUP MODAL ══════════════════════════════════ */
+function SupaSetupModal({ cfg, dbStatus, onSave, onClose }) {
+  const [url,     setUrl]     = useState(cfg?.url  || "");
+  const [key,     setKey]     = useState(cfg?.key  || "");
+  const [showKey, setShowKey] = useState(false);
+  const [busy,    setBusy]    = useState(false);
+  const [step,    setStep]    = useState("form"); // form | sql
+
+  const SQL = `-- Run this once in Supabase SQL Editor
+CREATE TABLE IF NOT EXISTS app_data (
+  key         TEXT PRIMARY KEY,
+  data        JSONB NOT NULL,
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Allow public read/write (anon key access)
+ALTER TABLE app_data ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "allow_all" ON app_data
+  FOR ALL USING (true) WITH CHECK (true);`;
+
+  const go = async () => {
+    if (!url.trim() || !key.trim()) return;
+    setBusy(true);
+    await onSave({ url: url.trim().replace(/\/$/, ""), key: key.trim() });
+    setBusy(false);
+  };
+
+  const copySQL = () => {
+    navigator.clipboard?.writeText(SQL).then(() => {}).catch(() => {});
+  };
+
+  const statusColor = dbStatus==="connected"?"#2d9e6b":dbStatus==="connecting"?"#d4a012":dbStatus==="error"?"#c1121f":"#3a2410";
+  const statusLabel = {connected:"✅ Connected",connecting:"⏳ Connecting…",error:"❌ Failed — check URL & key",disconnected:"⚫ Not Connected"}[dbStatus]||"";
+
+  return (
+    <div style={Z.overlay} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{...Z.modal,maxHeight:"92vh",overflowY:"auto"}}>
+        <div style={Z.modalTopBorder}/>
+        <button onClick={onClose} style={Z.modalClose}><Ic n="x" s={18} c="#4a3218"/></button>
+
+        {/* Header */}
+        <div style={{textAlign:"center",marginBottom:16}}>
+          <svg width={48} height={48} viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="#1C1C1C"/>
+            <path d="M24 8 L38 16 L38 32 L24 40 L10 32 L10 16 Z" fill="#3ECF8E" opacity="0.2"/>
+            <path d="M24 8 L38 16 L38 32 L24 40 L10 32 L10 16 Z" stroke="#3ECF8E" strokeWidth="2" fill="none"/>
+            <circle cx="24" cy="24" r="5" fill="#3ECF8E"/>
+          </svg>
+          <div style={{fontFamily:"'Cinzel',serif",color:"#e8d5a0",fontSize:18,fontWeight:700,marginTop:8}}>Supabase Setup</div>
+          <div style={{color:"#5a3a18",fontSize:11,marginTop:3}}>Free PostgreSQL cloud database</div>
+          {dbStatus!=="disconnected" && <div style={{color:statusColor,fontSize:12,marginTop:6,fontWeight:600}}>{statusLabel}</div>}
+        </div>
+
+        {/* Tab toggle */}
+        <div style={{display:"flex",gap:6,marginBottom:16}}>
+          <button onClick={()=>setStep("form")} style={{...Z.fBtn,flex:1,...(step==="form"?Z.fOn:{})}}>🔗 Connect</button>
+          <button onClick={()=>setStep("sql")}  style={{...Z.fBtn,flex:1,...(step==="sql" ?Z.fOn:{})}}>🗄️ SQL Setup</button>
+          <button onClick={()=>setStep("guide")} style={{...Z.fBtn,flex:1,...(step==="guide"?Z.fOn:{})}}>📋 Guide</button>
+        </div>
+
+        {/* ── CONNECT FORM ── */}
+        {step==="form" && <>
+          <label style={Z.lbl}>Project URL <span style={{color:"#3a2410"}}>(Settings → API → Project URL)</span></label>
+          <input style={Z.inp} value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://xxxx.supabase.co"/>
+
+          <label style={Z.lbl}>Anon / Public Key <span style={{color:"#3a2410"}}>(Settings → API → anon public)</span></label>
+          <div style={{position:"relative"}}>
+            <input style={{...Z.inp,paddingRight:44}} type={showKey?"text":"password"} value={key}
+              onChange={e=>setKey(e.target.value)} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6Ikp..."/>
+            <button onClick={()=>setShowKey(!showKey)} style={Z.eyeBtn}><Ic n={showKey?"eyeoff":"eye"} s={16} c="#5a3a18"/></button>
+          </div>
+
+          <div style={{background:"#060a08",border:"1px solid #1a2e1e",borderRadius:8,padding:"10px 12px",fontSize:11,color:"#2d6b40",marginBottom:16,lineHeight:1.7}}>
+            🔒 Credentials saved only in <strong>this browser</strong>. Never sent anywhere except Supabase.
+          </div>
+
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={onClose} style={Z.cancelBtn}>Cancel</button>
+            <button onClick={go} disabled={busy||!url||!key} style={{...Z.goldBtn,opacity:(busy||!url||!key)?0.5:1}}>
+              {busy?"Connecting…":"🟢 Connect Supabase"}
+            </button>
+          </div>
+        </>}
+
+        {/* ── SQL SETUP ── */}
+        {step==="sql" && <>
+          <div style={{color:"#5a3a18",fontSize:12,marginBottom:8,lineHeight:1.6}}>
+            Run this SQL once in your Supabase project → <strong style={{color:"#d4a012"}}>SQL Editor → New Query</strong> → paste → Run
+          </div>
+          <div style={{background:"#040a06",border:"1px solid #1a2e1a",borderRadius:10,padding:12,fontFamily:"monospace",fontSize:11,color:"#3ECF8E",lineHeight:1.8,marginBottom:12,whiteSpace:"pre-wrap",overflowX:"auto"}}>
+{SQL}
+          </div>
+          <button onClick={copySQL} style={{...Z.goldBtnSm,width:"100%",marginBottom:10,textAlign:"center"}}>
+            📋 Copy SQL
+          </button>
+          <div style={{color:"#3a2410",fontSize:11,textAlign:"center"}}>After running the SQL, go to <strong>Connect</strong> tab and enter your credentials.</div>
+        </>}
+
+        {/* ── GUIDE ── */}
+        {step==="guide" && <>
+          <div style={{background:"#0a0800",border:"1px solid #1e1408",borderRadius:12,padding:"14px",fontSize:12,color:"#5a3a18",lineHeight:2}}>
+            <div style={{color:"#d4a012",fontWeight:700,marginBottom:8,fontSize:13}}>📋 Step-by-Step Setup</div>
+            <div><span style={{color:"#d4a012"}}>1.</span> Go to <strong style={{color:"#3ECF8E"}}>supabase.com</strong> → Sign up free</div>
+            <div><span style={{color:"#d4a012"}}>2.</span> Click <strong>New Project</strong> → choose free tier → create</div>
+            <div><span style={{color:"#d4a012"}}>3.</span> Left menu → <strong>SQL Editor</strong> → run the SQL from the SQL tab above</div>
+            <div><span style={{color:"#d4a012"}}>4.</span> Left menu → <strong>Project Settings → API</strong></div>
+            <div><span style={{color:"#d4a012"}}>5.</span> Copy <strong>Project URL</strong> (https://xxxx.supabase.co)</div>
+            <div><span style={{color:"#d4a012"}}>6.</span> Copy <strong>anon / public</strong> key</div>
+            <div><span style={{color:"#d4a012"}}>7.</span> Go to <strong>Connect</strong> tab → paste both → Connect!</div>
+            <div style={{marginTop:8,color:"#2d9e6b"}}><strong>✅ That's it!</strong> All your data will sync across every device.</div>
+          </div>
+        </>}
+      </div>
+    </div>
+  );
+}
+
 
 /* ═══════════════════════ LOGIN MODAL ═══════════════════════════════════════ */
 function LoginModal({ onLogin, onClose }) {
